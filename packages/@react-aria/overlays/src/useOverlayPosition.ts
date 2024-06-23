@@ -32,16 +32,16 @@ export interface AriaPositionProps extends PositionProps {
   /**
    * The ref for the element which the overlay positions itself with respect to.
    */
-  targetRef: RefObject<Element>,
+  targetRef: RefObject<Element | null>,
   /**
    * The ref for the overlay element.
    */
-  overlayRef: RefObject<Element>,
+  overlayRef: RefObject<Element | null>,
   /**
    * A ref for the scrollable region within the overlay.
    * @default overlayRef
    */
-  scrollRef?: RefObject<Element>,
+  scrollRef?: RefObject<Element | null>,
   /**
    * Whether the overlay should update its position automatically.
    * @default true
@@ -192,6 +192,12 @@ export function useOverlayPosition(props: AriaPositionProps): PositionAria {
     onResize: updatePosition
   });
 
+  // Update position when the target changes size (might need to flip).
+  useResizeObserver({
+    ref: targetRef,
+    onResize: updatePosition
+  });
+
   // Reposition the overlay and do not close on scroll while the visual viewport is resizing.
   // This will ensure that overlays adjust their positioning when the iOS virtual keyboard appears.
   let isResizing = useRef(false);
@@ -244,7 +250,7 @@ export function useOverlayPosition(props: AriaPositionProps): PositionAria {
         position: 'absolute',
         zIndex: 100000, // should match the z-index in ModalTrigger
         ...position.position,
-        maxHeight: position.maxHeight
+        maxHeight: position.maxHeight ?? '100vh'
       }
     },
     placement: position.placement,

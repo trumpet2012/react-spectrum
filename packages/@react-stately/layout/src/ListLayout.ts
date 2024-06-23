@@ -10,7 +10,7 @@
  * governing permissions and limitations under the License.
  */
 
-import {Collection, DropTarget, DropTargetDelegate, Key, KeyboardDelegate, Node} from '@react-types/shared';
+import {Collection, DropTarget, DropTargetDelegate, Key, Node} from '@react-types/shared';
 import {getChildNodes} from '@react-stately/collections';
 import {InvalidationContext, Layout, LayoutInfo, Point, Rect, Size} from '@react-stately/virtualizer';
 
@@ -22,10 +22,10 @@ export type ListLayoutOptions<T> = {
   estimatedHeadingHeight?: number,
   padding?: number,
   indentationForItem?: (collection: Collection<Node<T>>, key: Key) => number,
-  collator?: Intl.Collator,
   loaderHeight?: number,
   placeholderHeight?: number,
-  allowDisabledKeyFocus?: boolean
+  forceSectionHeaders?: boolean,
+  enableEmptyState?: boolean
 };
 
 // A wrapper around LayoutInfo that supports hierarchy
@@ -38,41 +38,46 @@ export interface LayoutNode {
   index?: number
 }
 
+export interface ListLayoutProps {
+  isLoading?: boolean
+}
+
 const DEFAULT_HEIGHT = 48;
 
 /**
- * The ListLayout class is an implementation of a collection view {@link Layout}
+ * The ListLayout class is an implementation of a virtualizer {@link Layout}
  * it is used for creating lists and lists with indented sub-lists.
  *
  * To configure a ListLayout, you can use the properties to define the
  * layouts and/or use the method for defining indentation.
- * The {@link ListKeyboardDelegate} extends the existing collection view
+ * The {@link ListKeyboardDelegate} extends the existing virtualizer
  * delegate with an additional method to do this (it uses the same delegate object as
- * the collection view itself).
+ * the virtualizer itself).
  */
-export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, DropTargetDelegate {
+export class ListLayout<T> extends Layout<Node<T>, ListLayoutProps> implements DropTargetDelegate {
   protected rowHeight: number;
   protected estimatedRowHeight: number;
   protected headingHeight: number;
   protected estimatedHeadingHeight: number;
+  protected forceSectionHeaders: boolean;
   protected padding: number;
   protected indentationForItem?: (collection: Collection<Node<T>>, key: Key) => number;
   protected layoutInfos: Map<Key, LayoutInfo>;
   protected layoutNodes: Map<Key, LayoutNode>;
   protected contentSize: Size;
-  collection: Collection<Node<T>>;
-  disabledKeys: Set<Key> = new Set();
-  allowDisabledKeyFocus: boolean = false;
-  isLoading: boolean;
+  protected collection: Collection<Node<T>>;
+  protected isLoading: boolean;
   protected lastWidth: number;
   protected lastCollection: Collection<Node<T>>;
   protected rootNodes: LayoutNode[];
-  protected collator: Intl.Collator;
   protected invalidateEverything: boolean;
   protected loaderHeight: number;
   protected placeholderHeight: number;
-  protected lastValidRect: Rect;
+  protected enableEmptyState: boolean;
+  /** The rectangle containing currently valid layout infos. */
   protected validRect: Rect;
+  /** The rectangle of requested layout infos so far. */
+  protected requestedRect: Rect;
 
   /**
    * Creates a new ListLayout with options. See the list of properties below for a description
@@ -84,47 +89,39 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     this.estimatedRowHeight = options.estimatedRowHeight;
     this.headingHeight = options.headingHeight;
     this.estimatedHeadingHeight = options.estimatedHeadingHeight;
+    this.forceSectionHeaders = options.forceSectionHeaders;
     this.padding = options.padding || 0;
     this.indentationForItem = options.indentationForItem;
-    this.collator = options.collator;
     this.loaderHeight = options.loaderHeight;
     this.placeholderHeight = options.placeholderHeight;
+    this.enableEmptyState = options.enableEmptyState || false;
     this.layoutInfos = new Map();
     this.layoutNodes = new Map();
     this.rootNodes = [];
     this.lastWidth = 0;
     this.lastCollection = null;
-    this.allowDisabledKeyFocus = options.allowDisabledKeyFocus;
-    this.lastValidRect = new Rect();
     this.validRect = new Rect();
+    this.requestedRect = new Rect();
     this.contentSize = new Size();
   }
 
   getLayoutInfo(key: Key) {
-    let res = this.layoutInfos.get(key);
-
-    // If the layout info wasn't found, it might be outside the bounds of the area that we've
-    // computed layout for so far. This can happen when accessing a random key, e.g pressing Home/End.
-    // Compute the full layout and try again.
-    if (!res && this.validRect.area < this.contentSize.area && this.lastCollection) {
-      this.lastValidRect = this.validRect;
-      this.validRect = new Rect(0, 0, Infinity, Infinity);
-      this.rootNodes = this.buildCollection();
-      this.validRect = new Rect(0, 0, this.contentSize.width, this.contentSize.height);
-      res = this.layoutInfos.get(key);
-    }
-
-    return res;
+    this.ensureLayoutInfo(key);
+    return this.layoutInfos.get(key)!;
   }
 
   getVisibleLayoutInfos(rect: Rect) {
+    // Adjust rect to keep number of visible rows consistent.
+    // (only if height > 1 for getDropTargetFromPoint)
+    if (rect.height > 1) {
+      let rowHeight = (this.rowHeight ?? this.estimatedRowHeight);
+      rect.y = Math.floor(rect.y / rowHeight) * rowHeight;
+      rect.height = Math.ceil(rect.height / rowHeight) * rowHeight;
+    }
+
     // If layout hasn't yet been done for the requested rect, union the
     // new rect with the existing valid rect, and recompute.
-    if (!this.validRect.containsRect(rect) && this.lastCollection) {
-      this.lastValidRect = this.validRect;
-      this.validRect = this.validRect.union(rect);
-      this.rootNodes = this.buildCollection();
-    }
+    this.layoutIfNeeded(rect);
 
     let res: LayoutInfo[] = [];
 
@@ -147,25 +144,57 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     return res;
   }
 
-  isVisible(node: LayoutNode, rect: Rect) {
+  protected layoutIfNeeded(rect: Rect) {
+    if (!this.lastCollection) {
+      return;
+    }
+
+    if (!this.requestedRect.containsRect(rect)) {
+      this.requestedRect = this.requestedRect.union(rect);
+      this.rootNodes = this.buildCollection();
+    } else {
+      // Ensure all of the persisted keys are available.
+      for (let key of this.virtualizer.persistedKeys) {
+        if (this.ensureLayoutInfo(key)) {
+          break;
+        }
+      }
+    }
+  }
+
+  private ensureLayoutInfo(key: Key) {
+    // If the layout info wasn't found, it might be outside the bounds of the area that we've
+    // computed layout for so far. This can happen when accessing a random key, e.g pressing Home/End.
+    // Compute the full layout and try again.
+    if (!this.layoutInfos.has(key) && this.requestedRect.area < this.contentSize.area && this.lastCollection) {
+      this.requestedRect = new Rect(0, 0, Infinity, Infinity);
+      this.rootNodes = this.buildCollection();
+      this.requestedRect = new Rect(0, 0, this.contentSize.width, this.contentSize.height);
+      return true;
+    }
+
+    return false;
+  }
+
+  private isVisible(node: LayoutNode, rect: Rect) {
     return node.layoutInfo.rect.intersects(rect) || node.layoutInfo.isSticky || this.virtualizer.isPersistedKey(node.layoutInfo.key);
   }
 
-  protected shouldInvalidateEverything(invalidationContext: InvalidationContext<Node<T>, unknown>) {
+  protected shouldInvalidateEverything(invalidationContext: InvalidationContext<ListLayoutProps>) {
     // Invalidate cache if the size of the collection changed.
     // In this case, we need to recalculate the entire layout.
     return invalidationContext.sizeChanged;
   }
 
-  validate(invalidationContext: InvalidationContext<Node<T>, unknown>) {
+  validate(invalidationContext: InvalidationContext<ListLayoutProps>) {
     this.collection = this.virtualizer.collection;
+    this.isLoading = invalidationContext.layoutOptions?.isLoading || false;
 
     // Reset valid rect if we will have to invalidate everything.
     // Otherwise we can reuse cached layout infos outside the current visible rect.
     this.invalidateEverything = this.shouldInvalidateEverything(invalidationContext);
     if (this.invalidateEverything) {
-      this.lastValidRect = this.validRect;
-      this.validRect = this.virtualizer.getVisibleRect();
+      this.requestedRect = this.virtualizer.visibleRect.copy();
     }
 
     this.rootNodes = this.buildCollection();
@@ -187,9 +216,10 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     this.lastWidth = this.virtualizer.visibleRect.width;
     this.lastCollection = this.collection;
     this.invalidateEverything = false;
+    this.validRect = this.requestedRect.copy();
   }
 
-  buildCollection(): LayoutNode[] {
+  protected buildCollection(): LayoutNode[] {
     let y = this.padding;
     let skipped = 0;
     let nodes = [];
@@ -197,17 +227,17 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
       let rowHeight = (this.rowHeight ?? this.estimatedRowHeight);
 
       // Skip rows before the valid rectangle unless they are already cached.
-      if (node.type === 'item' && y + rowHeight < this.validRect.y && !this.isValid(node, y)) {
+      if (node.type === 'item' && y + rowHeight < this.requestedRect.y && !this.isValid(node, y)) {
         y += rowHeight;
         skipped++;
         continue;
       }
 
-      let layoutNode = this.buildChild(node, 0, y);
+      let layoutNode = this.buildChild(node, 0, y, null);
       y = layoutNode.layoutInfo.rect.maxY;
       nodes.push(layoutNode);
 
-      if (node.type === 'item' && y > this.validRect.maxY) {
+      if (node.type === 'item' && y > this.requestedRect.maxY) {
         y += (this.collection.size - (nodes.length + skipped)) * rowHeight;
         break;
       }
@@ -222,7 +252,7 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
       y = loader.rect.maxY;
     }
 
-    if (nodes.length === 0) {
+    if (nodes.length === 0 && this.enableEmptyState) {
       let rect = new Rect(0, y, this.virtualizer.visibleRect.width,
         this.placeholderHeight ?? this.virtualizer.visibleRect.height);
       let placeholder = new LayoutInfo('placeholder', 'placeholder', rect);
@@ -235,19 +265,19 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     return nodes;
   }
 
-  isValid(node: Node<T>, y: number) {
+  protected isValid(node: Node<T>, y: number) {
     let cached = this.layoutNodes.get(node.key);
     return (
       !this.invalidateEverything &&
       cached &&
       cached.node === node &&
       y === (cached.header || cached.layoutInfo).rect.y &&
-      cached.layoutInfo.rect.intersects(this.lastValidRect) &&
-      cached.validRect.containsRect(cached.layoutInfo.rect.intersection(this.validRect))
+      cached.layoutInfo.rect.intersects(this.validRect) &&
+      cached.validRect.containsRect(cached.layoutInfo.rect.intersection(this.requestedRect))
     );
   }
 
-  buildChild(node: Node<T>, x: number, y: number): LayoutNode {
+  protected buildChild(node: Node<T>, x: number, y: number, parentKey: Key | null): LayoutNode {
     if (this.isValid(node, y)) {
       return this.layoutNodes.get(node.key);
     }
@@ -255,7 +285,7 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     let layoutNode = this.buildNode(node, x, y);
     layoutNode.node = node;
 
-    layoutNode.layoutInfo.parentKey = node.parentKey ?? null;
+    layoutNode.layoutInfo.parentKey = parentKey ?? null;
     this.layoutInfos.set(layoutNode.layoutInfo.key, layoutNode.layoutInfo);
     if (layoutNode.header) {
       this.layoutInfos.set(layoutNode.header.key, layoutNode.header);
@@ -265,46 +295,27 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     return layoutNode;
   }
 
-  buildNode(node: Node<T>, x: number, y: number): LayoutNode {
+  protected buildNode(node: Node<T>, x: number, y: number): LayoutNode {
     switch (node.type) {
       case 'section':
         return this.buildSection(node, x, y);
       case 'item':
         return this.buildItem(node, x, y);
+      case 'header':
+        return this.buildSectionHeader(node, x, y);
     }
   }
 
-  buildSection(node: Node<T>, x: number, y: number): LayoutNode {
+  private buildSection(node: Node<T>, x: number, y: number): LayoutNode {
     let width = this.virtualizer.visibleRect.width;
-    let rectHeight = this.headingHeight;
-    let isEstimated = false;
-
-    // If no explicit height is available, use an estimated height.
-    if (rectHeight == null) {
-      // If a previous version of this layout info exists, reuse its height.
-      // Mark as estimated if the size of the overall collection view changed,
-      // or the content of the item changed.
-      let previousLayoutNode = this.layoutNodes.get(node.key);
-      if (previousLayoutNode && previousLayoutNode.header) {
-        let curNode = this.collection.getItem(node.key);
-        let lastNode = this.lastCollection ? this.lastCollection.getItem(node.key) : null;
-        rectHeight = previousLayoutNode.header.rect.height;
-        isEstimated = width !== this.lastWidth || curNode !== lastNode || previousLayoutNode.header.estimatedSize;
-      } else {
-        rectHeight = (node.rendered ? this.estimatedHeadingHeight : 0);
-        isEstimated = true;
-      }
+    let header = null;
+    if (node.rendered || this.forceSectionHeaders) {
+      let headerNode = this.buildSectionHeader(node, x, y);
+      header = headerNode.layoutInfo;
+      header.key += ':header';
+      header.parentKey = node.key;
+      y += header.rect.height;
     }
-
-    if (rectHeight == null) {
-      rectHeight = DEFAULT_HEIGHT;
-    }
-
-    let headerRect = new Rect(0, y, width, rectHeight);
-    let header = new LayoutInfo('header', node.key + ':header', headerRect);
-    header.estimatedSize = isEstimated;
-    header.parentKey = node.key;
-    y += header.rect.height;
 
     let rect = new Rect(0, y, width, 0);
     let layoutInfo = new LayoutInfo(node.type, node.key, rect);
@@ -316,17 +327,17 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
       let rowHeight = (this.rowHeight ?? this.estimatedRowHeight);
 
       // Skip rows before the valid rectangle unless they are already cached.
-      if (y + rowHeight < this.validRect.y && !this.isValid(node, y)) {
+      if (y + rowHeight < this.requestedRect.y && !this.isValid(node, y)) {
         y += rowHeight;
         skipped++;
         continue;
       }
 
-      let layoutNode = this.buildChild(child, x, y);
+      let layoutNode = this.buildChild(child, x, y, layoutInfo.key);
       y = layoutNode.layoutInfo.rect.maxY;
       children.push(layoutNode);
 
-      if (y > this.validRect.maxY) {
+      if (y > this.requestedRect.maxY) {
         // Estimate the remaining height for rows that we don't need to layout right now.
         y += ([...getChildNodes(node, this.collection)].length - (children.length + skipped)) * rowHeight;
         break;
@@ -339,11 +350,48 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
       header,
       layoutInfo,
       children,
-      validRect: layoutInfo.rect.intersection(this.validRect)
+      validRect: layoutInfo.rect.intersection(this.requestedRect)
     };
   }
 
-  buildItem(node: Node<T>, x: number, y: number): LayoutNode {
+  private buildSectionHeader(node: Node<T>, x: number, y: number): LayoutNode {
+    let width = this.virtualizer.visibleRect.width;
+    let rectHeight = this.headingHeight;
+    let isEstimated = false;
+
+    // If no explicit height is available, use an estimated height.
+    if (rectHeight == null) {
+      // If a previous version of this layout info exists, reuse its height.
+      // Mark as estimated if the size of the overall virtualizer changed,
+      // or the content of the item changed.
+      let previousLayoutNode = this.layoutNodes.get(node.key);
+      let previousLayoutInfo = previousLayoutNode?.header || previousLayoutNode?.layoutInfo;
+      if (previousLayoutInfo) {
+        let curNode = this.collection.getItem(node.key);
+        let lastNode = this.lastCollection ? this.lastCollection.getItem(node.key) : null;
+        rectHeight = previousLayoutInfo.rect.height;
+        isEstimated = width !== this.lastWidth || curNode !== lastNode || previousLayoutInfo.estimatedSize;
+      } else {
+        rectHeight = (node.rendered ? this.estimatedHeadingHeight : 0);
+        isEstimated = true;
+      }
+    }
+
+    if (rectHeight == null) {
+      rectHeight = DEFAULT_HEIGHT;
+    }
+
+    let headerRect = new Rect(0, y, width, rectHeight);
+    let header = new LayoutInfo('header', node.key, headerRect);
+    header.estimatedSize = isEstimated;
+    return {
+      layoutInfo: header,
+      children: [],
+      validRect: header.rect.intersection(this.requestedRect)
+    };
+  }
+
+  private buildItem(node: Node<T>, x: number, y: number): LayoutNode {
     let width = this.virtualizer.visibleRect.width;
     let rectHeight = this.rowHeight;
     let isEstimated = false;
@@ -351,7 +399,7 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     // If no explicit height is available, use an estimated height.
     if (rectHeight == null) {
       // If a previous version of this layout info exists, reuse its height.
-      // Mark as estimated if the size of the overall collection view changed,
+      // Mark as estimated if the size of the overall virtualizer changed,
       // or the content of the item changed.
       let previousLayoutNode = this.layoutNodes.get(node.key);
       if (previousLayoutNode) {
@@ -396,6 +444,13 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
       newLayoutInfo.rect.height = size.height;
       this.layoutInfos.set(key, newLayoutInfo);
 
+      // Items after this layoutInfo will need to be repositioned to account for the new height.
+      // Adjust the validRect so that only items above remain valid.
+      this.validRect.height = Math.min(this.validRect.height, layoutInfo.rect.y - this.validRect.y);
+
+      // The requestedRect also needs to be adjusted to account for the height difference.
+      this.requestedRect.height += newLayoutInfo.rect.height - layoutInfo.rect.height;
+
       // Invalidate layout for this layout node and all parents
       this.updateLayoutNode(key, layoutInfo, newLayoutInfo);
 
@@ -411,11 +466,11 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
     return false;
   }
 
-  updateLayoutNode(key: Key, oldLayoutInfo: LayoutInfo, newLayoutInfo: LayoutInfo) {
+  private updateLayoutNode(key: Key, oldLayoutInfo: LayoutInfo, newLayoutInfo: LayoutInfo) {
     let n = this.layoutNodes.get(key);
     if (n) {
-      // Invalidate by reseting validRect.
-      n.validRect = new Rect();
+      // Invalidate by intersecting the validRect of this node with the overall validRect.
+      n.validRect = n.validRect.intersection(this.validRect);
 
       // Replace layout info in LayoutNode
       if (n.header === oldLayoutInfo) {
@@ -428,128 +483,6 @@ export class ListLayout<T> extends Layout<Node<T>> implements KeyboardDelegate, 
 
   getContentSize() {
     return this.contentSize;
-  }
-
-  getKeyAbove(key: Key): Key | null {
-    let collection = this.collection;
-
-    key = collection.getKeyBefore(key);
-    while (key != null) {
-      let item = collection.getItem(key);
-      if (item.type === 'item' && (this.allowDisabledKeyFocus || !this.disabledKeys.has(item.key))) {
-        return key;
-      }
-
-      key = collection.getKeyBefore(key);
-    }
-  }
-
-  getKeyBelow(key: Key): Key | null {
-    let collection = this.collection;
-
-    key = collection.getKeyAfter(key);
-    while (key != null) {
-      let item = collection.getItem(key);
-      if (item.type === 'item' && (this.allowDisabledKeyFocus || !this.disabledKeys.has(item.key))) {
-        return key;
-      }
-
-      key = collection.getKeyAfter(key);
-    }
-  }
-
-  getKeyPageAbove(key: Key): Key | null {
-    let layoutInfo = this.getLayoutInfo(key);
-
-    if (layoutInfo) {
-      let pageY = Math.max(0, layoutInfo.rect.y + layoutInfo.rect.height - this.virtualizer.visibleRect.height);
-      while (layoutInfo && layoutInfo.rect.y > pageY) {
-        let keyAbove = this.getKeyAbove(layoutInfo.key);
-        layoutInfo = this.getLayoutInfo(keyAbove);
-      }
-
-      if (layoutInfo) {
-        return layoutInfo.key;
-      }
-    }
-
-    return this.getFirstKey();
-  }
-
-  getKeyPageBelow(key: Key): Key | null {
-    let layoutInfo = this.getLayoutInfo(key != null ? key : this.getFirstKey());
-
-    if (layoutInfo) {
-      let pageY = Math.min(this.virtualizer.contentSize.height, layoutInfo.rect.y - layoutInfo.rect.height + this.virtualizer.visibleRect.height);
-      while (layoutInfo && layoutInfo.rect.y < pageY) {
-        let keyBelow = this.getKeyBelow(layoutInfo.key);
-        layoutInfo = this.getLayoutInfo(keyBelow);
-      }
-
-      if (layoutInfo) {
-        return layoutInfo.key;
-      }
-    }
-
-    return this.getLastKey();
-  }
-
-  getFirstKey(): Key | null {
-    let collection = this.collection;
-    let key = collection.getFirstKey();
-    while (key != null) {
-      let item = collection.getItem(key);
-      if (item.type === 'item' && (this.allowDisabledKeyFocus || !this.disabledKeys.has(item.key))) {
-        return key;
-      }
-
-      key = collection.getKeyAfter(key);
-    }
-  }
-
-  getLastKey(): Key | null {
-    let collection = this.collection;
-    let key = collection.getLastKey();
-    while (key != null) {
-      let item = collection.getItem(key);
-      if (item.type === 'item' && (this.allowDisabledKeyFocus || !this.disabledKeys.has(item.key))) {
-        return key;
-      }
-
-      key = collection.getKeyBefore(key);
-    }
-  }
-
-  getKeyForSearch(search: string, fromKey?: Key): Key | null {
-    if (!this.collator) {
-      return null;
-    }
-
-    let collection = this.collection;
-    let key = fromKey || this.getFirstKey();
-    while (key != null) {
-      let item = collection.getItem(key);
-      let substring = item.textValue.slice(0, search.length);
-      if (item.textValue && this.collator.compare(substring, search) === 0) {
-        return key;
-      }
-
-      key = this.getKeyBelow(key);
-    }
-
-    return null;
-  }
-
-  getInitialLayoutInfo(layoutInfo: LayoutInfo) {
-    layoutInfo.opacity = 0;
-    layoutInfo.transform = 'scale3d(0.8, 0.8, 0.8)';
-    return layoutInfo;
-  }
-
-  getFinalLayoutInfo(layoutInfo: LayoutInfo) {
-    layoutInfo.opacity = 0;
-    layoutInfo.transform = 'scale3d(0.8, 0.8, 0.8)';
-    return layoutInfo;
   }
 
   getDropTargetFromPoint(x: number, y: number, isValidDropTarget: (target: DropTarget) => boolean): DropTarget {
