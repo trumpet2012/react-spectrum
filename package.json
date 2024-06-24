@@ -28,7 +28,7 @@
     "test-loose": "cross-env VIRT_ON=1 yarn jest",
     "test-storybook": "test-storybook --url http://localhost:9003  --browsers chromium --no-cache",
     "build": "make build",
-    "test:ssr": "cross-env STRICT_MODE=1 yarn jest --maxWorkers=50% --config jest.ssr.config.js",
+    "test:ssr": "cross-env STRICT_MODE=1 yarn jest --config jest.ssr.config.js",
     "ci-test": "cross-env STRICT_MODE=1 yarn jest --maxWorkers=2 && cross-env STRICT_MODE=1 yarn test:ssr --runInBand",
     "lint": "concurrently \"yarn check-types\" \"eslint packages --ext .js,.ts,.tsx\" \"node scripts/lint-packages.js\"",
     "jest": "node scripts/jest.js",
